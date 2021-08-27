@@ -53,31 +53,44 @@ class XBRL10KQParser(object):
         soup = BeautifulSoup(edgar_str, 'html.parser')
         link_tags = soup.find_all('a', id='documentsbutton')
         doc_links = [f'{self.url}{link_tag["href"]}' for link_tag in link_tags]
-        xbrl_links = []
+        xbrl_links = {}
         for link in doc_links:
             doc_resp = requests.get(link, headers=HEADERS)
             if doc_resp.status_code == 200:
                 doc_str = doc_resp.text
                 soup = BeautifulSoup(doc_str, 'html.parser')
                 amend_label = soup.find('div', id='formName')
-                if amend_label and '[amend]' in amend_label.text.lower():
-                    # Skip amended filings for now as I'm unsure of how to parse them
-                    continue
-                table_tag = soup.find('table', class_='tableFile', summary='Data Files')
-                if table_tag:
-                    # If this table_tag doesn't exist, then it's likely the old style SEC filing so ignore these for now
-                    rows = table_tag.find_all('tr')
-                    for row in rows:
-                        cells = row.find_all('td')
-                        if len(cells) > 3:
-                            if 'XBRL INSTANCE DOCUMENT' in cells[1].text:
-                                xbrl_links.append('https://www.sec.gov' + cells[2].a['href'])
+                report_date_tags = soup.select('#formDiv > div.formContent > div:nth-child(2) > div.info')
+                if report_date_tags:
+                    report_date = report_date_tags[0].text
+                    filing_date_tags = \
+                        soup.select('#formDiv > div.formContent > div:nth-child(1) > div:nth-child(2)')
+                    filing_date = filing_date_tags[0].text if filing_date_tags else None
+                    existing_filing_date = xbrl_links[report_date][0] if report_date in xbrl_links else None
+                    if existing_filing_date and filing_date < existing_filing_date:
+                        # If a report link for a given report_date exists and has been filed at a later date than the
+                        # current iteration's filing date, then it's likely an amendment which was filed later. Use the
+                        # amended report link instead of the original
+                        continue
+                    table_tag = soup.find('table', class_='tableFile', summary='Data Files')
+                    if table_tag:
+                        # If this table_tag doesn't exist, then it's likely the old style SEC filing so ignore these for now
+                        rows = table_tag.find_all('tr')
+                        for row in rows:
+                            cells = row.find_all('td')
+                            if len(cells) > 3:
+                                if 'XBRL INSTANCE DOCUMENT' in cells[1].text:
+                                    xbrl_links[report_date] = ('https://www.sec.gov' + cells[2].a['href'],
+                                                               filing_date)
         return xbrl_links
 
     def get_unique_tags(self, num_links_to_check=1):
         num_links_to_check = num_links_to_check if num_links_to_check > 0 else 1
         if self.xbrl_urls:
-            url_list = self.xbrl_urls[:num_links_to_check]
+            url_list = []
+            for num, url_tuple in enumerate(self.xbrl_urls.items()):
+                if num <= num_links_to_check:
+                    url_list.append(url_tuple[1][0])
             unique_tags = set()
             for url in url_list:
                 resp = requests.get(url, headers=HEADERS)
@@ -90,7 +103,7 @@ class XBRL10KQParser(object):
     def get_filing_data(self, tag_list):
         date_tag_str = 'dei:documentperiodenddate'
         filing_results = []
-        for url in self.xbrl_urls:
+        for url, _ in self.xbrl_urls.items():
             resp = requests.get(url, headers=HEADERS)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
