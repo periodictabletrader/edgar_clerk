@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 from ..ref_data.enum import XBRLEnum
 from ..request_headers import HEADERS
+from ..utils import wrap_list
 
 
 def parse_txt(txt):
@@ -14,19 +15,49 @@ def parse_txt(txt):
     return parsed_txt
 
 
-class XBRL10KQParser(object):
+class FilingsClerk(object):
 
-    def __init__(self, cik, filing_type=XBRLEnum.X10K.value, limit=None, dateb=None):
+    def __init__(self, cik, filing_types=None, limit=None, dateb=None):
         self.cik = cik
         self.limit = limit
         self.dateb = self._parse_date(dateb)
-        filings_url_params = {
-            'action': XBRLEnum.COMPANY.value,
-            'CIK': self.cik,
-            'type': filing_type
-        }
-        self.filings_response = requests.get(self.browse_url, params=filings_url_params, headers=HEADERS)
-        self.xbrl_urls = self.get_xbrl_urls(self.filings_response.text)
+        filing_types = wrap_list(filing_types)
+        self._filing_types = filing_types or [XBRLEnum.X10K]
+        self._xbrl_urls = {}
+        self._filings_responses = {}
+
+    @property
+    def filing_types(self):
+        return self._filing_types
+
+    @filing_types.setter
+    def filing_types(self, new_filing_types):
+        new_filing_types = wrap_list(new_filing_types)
+        filtered_filing_types = \
+            [filing_type for filing_type in new_filing_types if filing_type in XBRLEnum.COMPANY_FORM_TYPES]
+        if filtered_filing_types:
+            self._filing_types = filtered_filing_types
+        else:
+            raise Exception(
+                f'Inappropriate Filing Types passed. Supported Filing Types are {XBRLEnum.COMPANY_FORM_TYPES}')
+
+    @property
+    def filings_responses(self):
+        return self._filings_responses
+
+    @property
+    def xbrl_urls(self):
+        if not self._xbrl_urls:
+            request_params = {
+                'action': XBRLEnum.COMPANY,
+                'CIK': self.cik,
+            }
+            for filing_type in self.filing_types:
+                request_params['type'] = filing_type
+                response = requests.get(self.browse_url, params=request_params, headers=HEADERS)
+                self._filings_responses[filing_type] = response
+                self._xbrl_urls[filing_type] = self.get_xbrl_urls(response.text)
+        return self._xbrl_urls
 
     @property
     def browse_url(self):
@@ -59,7 +90,6 @@ class XBRL10KQParser(object):
             if doc_resp.status_code == 200:
                 doc_str = doc_resp.text
                 soup = BeautifulSoup(doc_str, 'html.parser')
-                amend_label = soup.find('div', id='formName')
                 report_date_tags = soup.select('#formDiv > div.formContent > div:nth-child(2) > div.info')
                 if report_date_tags:
                     report_date = report_date_tags[0].text
@@ -74,21 +104,24 @@ class XBRL10KQParser(object):
                         continue
                     table_tag = soup.find('table', class_='tableFile', summary='Data Files')
                     if table_tag:
-                        # If this table_tag doesn't exist, then it's likely the old style SEC filing so ignore these for now
+                        # If this table_tag doesn't exist, then it's likely an old style SEC filing - ignore for now
                         rows = table_tag.find_all('tr')
                         for row in rows:
                             cells = row.find_all('td')
                             if len(cells) > 3:
                                 if 'XBRL INSTANCE DOCUMENT' in cells[1].text:
-                                    xbrl_links[report_date] = ('https://www.sec.gov' + cells[2].a['href'],
-                                                               filing_date)
+                                    xbrl_links[report_date] = ('https://www.sec.gov' + cells[2].a['href'], filing_date)
         return xbrl_links
 
-    def get_unique_tags(self, num_links_to_check=1):
+    def get_unique_tags(self, filing_type=None, num_links_to_check=1):
+        if filing_type is not None and filing_type not in self.filing_types:
+            raise Exception(f'Invalid Filing Type used. This object can only pull {self.filing_types}')
+        else:
+            filing_type = self.filing_types[0]
         num_links_to_check = num_links_to_check if num_links_to_check > 0 else 1
-        if self.xbrl_urls:
+        if self.xbrl_urls[filing_type]:
             url_list = []
-            for num, url_tuple in enumerate(self.xbrl_urls.items()):
+            for num, url_tuple in enumerate(self.xbrl_urls[filing_type].items()):
                 if num <= num_links_to_check:
                     url_list.append(url_tuple[1][0])
             unique_tags = set()
@@ -100,10 +133,16 @@ class XBRL10KQParser(object):
                     unique_tags = unique_tags.union(tag_list)
             return unique_tags
 
-    def get_filing_data(self, tag_list):
+    def get_filing_data(self, filing_type=None, tag_list=None):
+        if filing_type is not None and filing_type not in self.filing_types:
+            raise Exception(f'Invalid Filing Type used. This object can only pull {self.filing_types}')
+        else:
+            filing_type = self.filing_types[0]
         date_tag_str = 'dei:documentperiodenddate'
+        tag_list = tag_list or []
         filing_results = []
-        for url, _ in self.xbrl_urls.items():
+        for report_date, url_info in self.xbrl_urls[filing_type].items():
+            url, _ = url_info
             resp = requests.get(url, headers=HEADERS)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
